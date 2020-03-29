@@ -6,7 +6,7 @@
 ;; URL: http://github.com/ngrunwald/ob-bigquery
 ;; Version: 0.1.0
 ;; Package-Requires: ((spinner "1.7.3") (aio "") (om "")
-;;                    (ht "") (treepy ""))
+;;                    (ht "") (s ""))
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -30,7 +30,9 @@
 (require 'json)
 (require 'aio)
 (require 'om)
-(require 'treepy)
+(require 'spinner)
+(require 'ht)
+(require 's)
 
 (setq lexical-binding t)
 
@@ -51,10 +53,19 @@
     (aio-await p-result)
     (funcall (aio-result p-result))))
 
-(defun bq--analyze-field (f-spec )
-  (-if-let (fields (ht-get f-spec "fields"))
-      '()
-    (list (ht-set f-spec "path" '()))))
+(defun bq--set (hmap key val)
+  (ht-set! hmap key val)
+  hmap)
+
+(defun bq--analyze-field (f-spec &optional path)
+  (-let* ((nam (ht-get f-spec "name"))
+          (current (bq--set f-spec "path" (append path (list nam)))))
+    (-if-let (fields (ht-get f-spec "fields"))
+        (append (list current) (-mapcat (lambda (f) (bq--analyze-field f (append path (list nam)))) fields))
+      (list current))))
+
+(defun bq--analyze-schema (s)
+  (-mapcat 'bq--analyze-field (ht-get s "fields")))
 
 (defun bq--to-human-size (x)
   (-> x
@@ -104,13 +115,13 @@
     (condition-case err
         (-let* ((data (funcall (aio-result data-p)))
                 ;; _  (setq ng-data data)
-                (rows (cl-loop for elt in bq-info-keys
-                               when (condition-case _
-                                        (apply 'ht-get* data (car elt))
-                                      (error nil))
-                               collect
-                               (-let [(ks . (label . f)) elt]
-                                 (list label (funcall f (apply 'ht-get* data ks)))))))
+                (info-rows (cl-loop for elt in bq-info-keys
+                                    when (condition-case _
+                                             (apply 'ht-get* data (car elt))
+                                           (error nil))
+                                    collect
+                                    (-let [(ks . (label . f)) elt]
+                                      (list label (funcall f (apply 'ht-get* data ks)))))))
 
           (-when-let (desc (ht-get data "description"))
             (insert "*Description*\n\n")
@@ -124,9 +135,23 @@
             (insert (-> (om-build-src-block :value query :language "sql") (om-to-trimmed-string)))
             (insert "\n\n"))
 
-          (->> (apply 'om-build-table! rows)
+          (->> (apply 'om-build-table! info-rows)
                (om-to-trimmed-string)
                (insert))
+          (insert "\n\n")
+
+          (-when-let (schema (ht-get data "schema"))
+            (-let* ((fields (bq--analyze-schema schema))
+                    (schema-rows (cl-loop for elt in fields
+                                      collect
+                                      (-> (list (s-join "." (ht-get elt "path"))
+                                                (ht-get elt "type")
+                                                (ht-get elt "mode"))
+                                          (append (-when-let (desc (ht-get elt "description"))
+                                                    (list )desc))))))
+              (->> (apply 'om-build-table! schema-rows)
+                        (om-to-trimmed-string)
+                        (insert))))
 
           (spinner-stop))
       (error (message "ERROR => %s" err)))
