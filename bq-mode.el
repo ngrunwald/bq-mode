@@ -5,7 +5,8 @@
 ;; Author: GRUNWALD Nils
 ;; URL: http://github.com/ngrunwald/ob-bigquery
 ;; Version: 0.1.0
-;; Package-Requires: ((s "1.9.0") (spinner "1.7.3"))
+;; Package-Requires: ((spinner "1.7.3") (aio "") (om "")
+;;                    (ht "") (treepy ""))
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -28,7 +29,8 @@
 ;;; Code:
 (require 'json)
 (require 'aio)
-(require 'hierarchy)
+(require 'om)
+(require 'treepy)
 
 (setq lexical-binding t)
 
@@ -44,18 +46,91 @@
     (aio-await p-result)
     (funcall (aio-result p-result))))
 
-(defun bq-entity-info (id)
+(aio-defun bq-get-entity-info (id)
+  (-let* ((p-result (bq-async-json-command (format "bq --format=json show %s" id))))
+    (aio-await p-result)
+    (funcall (aio-result p-result))))
+
+(defun bq--analyze-field (f-spec )
+  (-if-let (fields (ht-get f-spec "fields"))
+      '()
+    (list (ht-set f-spec "path" '()))))
+
+(defun bq--to-human-size (x)
+  (-> x
+      (string-to-number)
+      (file-size-human-readable)))
+
+(defun bq--format-date (d)
+  (-> d
+       (string-to-number)
+       (/ 1000)
+       ((lambda (x) (format-time-string "%F %T" x)))))
+
+(defun bq--add-number-grouping (num &optional separator)
+  "Add commas to NUMBER and return it as a string.
+   Optional SEPARATOR is the string to use to separate groups.
+   It defaults to a comma."
+  (let ((op (or separator ",")))
+    (while (string-match "\\(.*[0-9]\\)\\([0-9][0-9][0-9].*\\)" num)
+      (setq num (concat
+                 (match-string 1 num) op
+                 (match-string 2 num))))
+    num))
+
+(setq bq-info-keys
+      (list
+       `(("id") . ("Id" . identity))
+       `(("type") . ("Type" . identity))
+       `(("timePartitioning" "type") . ("Time Partitioning Type" . identity))
+       `(("view" "useLegacySql") . ("Use Legacy SQL" . identity))
+       `(("numRows") . ("Rows" . bq--add-number-grouping))
+       `(("numBytes") . ("Size" . bq--to-human-size))
+       `(("numLongTermBytes") . ("Long Term Size" . bq--to-human-size))
+       `(("creationTime") . ("Creation Time" . bq--format-date))
+       `(("lastModifiedTime") . ("Last Modified Time" . bq--format-date))
+       `(("location") . ("Location" . identity))))
+
+
+(aio-defun bq-entity-info (id)
   (interactive)
   (-let* ((buffer "*BigQuery-Info*")
-          (proc-name "*BigQuery-Info-Proc*")
-          (proc (start-process-shell-command proc-name buffer
-                                             (format "bq --quiet --format=pretty show %s" id))))
+          (data-p (bq-get-entity-info id)))
     (switch-to-buffer buffer)
+    (org-mode)
     (spinner-start 'progress-bar)
-    (set-process-sentinel proc
-                          (lambda (process event)
-                            (progn (spinner-stop)
-                                   (read-only-mode))))))
+    (aio-await data-p)
+    (setq ng-data (funcall (aio-result data-p)))
+    (condition-case err
+        (-let* ((data (funcall (aio-result data-p)))
+                ;; _  (setq ng-data data)
+                (rows (cl-loop for elt in bq-info-keys
+                               when (condition-case _
+                                        (apply 'ht-get* data (car elt))
+                                      (error nil))
+                               collect
+                               (-let [(ks . (label . f)) elt]
+                                 (list label (funcall f (apply 'ht-get* data ks)))))))
+
+          (-when-let (desc (ht-get data "description"))
+            (insert "*Description*\n\n")
+            (insert desc)
+            (insert "\n\n"))
+
+          (-when-let (query (condition-case _
+                                (ht-get* data "view" "query")
+                              (error nil)))
+            (insert "*View Query*\n\n")
+            (insert (-> (om-build-src-block :value query :language "sql") (om-to-trimmed-string)))
+            (insert "\n\n"))
+
+          (->> (apply 'om-build-table! rows)
+               (om-to-trimmed-string)
+               (insert))
+
+          (spinner-stop))
+      (error (message "ERROR => %s" err)))
+    ))
 
 (define-derived-mode bq-datasets-mode tablist-mode "BigQuery Datasets"
   "Mode for exploring the datasets in a project"
@@ -78,7 +153,7 @@
          (rows (-map (lambda (it)
                        `(,(ht-get it "id") [,(ht-get* it "tableReference" "tableId")
                                             ,(ht-get it "type")
-                                            ,(ht-get it "creationTime")]))
+                                            ,(-> it (ht-get "creationTime") (bq--format-date))]))
                      bq-current-tables-list)))
     (setq tabulated-list-format columns)
     (setq tabulated-list-entries rows)
