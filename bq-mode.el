@@ -113,56 +113,53 @@
     (orgtbl-mode)
     (spinner-start 'progress-bar)
     (aio-await data-p)
-    (condition-case err
-        (-let* ((data (funcall (aio-result data-p)))
-                (info-rows (cl-loop for elt in bq-info-keys
-                                    when (condition-case _
-                                             (apply 'ht-get* data (car elt))
-                                           (error nil))
-                                    collect
-                                    (-let [(ks . (label . f)) elt]
-                                      (list label (funcall f (apply 'ht-get* data ks)))))))
+    (-let* ((data (funcall (aio-result data-p)))
+            (info-rows (cl-loop for elt in bq-info-keys
+                                when (condition-case _
+                                         (apply 'ht-get* data (car elt))
+                                       (error nil))
+                                collect
+                                (-let [(ks . (label . f)) elt]
+                                  (list label (funcall f (apply 'ht-get* data ks)))))))
 
-          (-when-let (desc (ht-get data "description"))
-            (insert (propertize "Description" 'face 'bold-italic))
-            (insert "\n\n")
-            (insert desc)
-            (insert "\n\n"))
+      (-when-let (desc (ht-get data "description"))
+        (insert (propertize "Description" 'face 'bold-italic))
+        (insert "\n\n")
+        (insert desc)
+        (insert "\n\n"))
 
-          (-when-let (query (condition-case _
-                                (ht-get* data "view" "query")
-                              (error nil)))
-            (insert (propertize "View Query" 'face 'bold-italic))
-            (insert "\n\n")
-            (insert query)
-            (insert "\n\n"))
+      (-when-let (query (condition-case _
+                            (ht-get* data "view" "query")
+                          (error nil)))
+        (insert (propertize "View Query" 'face 'bold-italic))
+        (insert "\n\n")
+        (insert query)
+        (insert "\n\n"))
 
-          (insert (propertize "Information" 'face 'bold-italic))
-          (insert "\n\n")
-          (->> (apply 'om-build-table! info-rows)
-               (om-to-trimmed-string)
-               (insert))
-          (insert "\n\n")
+      (insert (propertize "Information" 'face 'bold-italic))
+      (insert "\n\n")
+      (->> (apply 'om-build-table! info-rows)
+           (om-to-trimmed-string)
+           (insert))
+      (insert "\n\n")
 
-          (-when-let (schema (ht-get data "schema"))
-            (-let* ((fields (bq--analyze-schema schema))
-                    (schema-rows (cl-loop for elt in fields
+      (-when-let (schema (ht-get data "schema"))
+        (-let* ((fields (bq--analyze-schema schema))
+                (schema-rows (cl-loop for elt in fields
                                       collect
                                       (-> (list (s-join "." (ht-get elt "path"))
                                                 (ht-get elt "type")
                                                 (ht-get elt "mode"))
                                           (append (-when-let (desc (ht-get elt "description"))
                                                     (list )desc))))))
-              (insert (propertize "Schema" 'face 'bold-italic))
-              (insert "\n\n")
-              (->> (apply 'om-build-table! schema-rows)
-                   (om-to-trimmed-string)
-                   (insert))
-              (insert "\n")))
-          (read-only-mode)
-          (spinner-stop))
-      (error (message "ERROR => %s" err)))
-    ))
+          (insert (propertize "Schema" 'face 'bold-italic))
+          (insert "\n\n")
+          (->> (apply 'om-build-table! schema-rows)
+               (om-to-trimmed-string)
+               (insert))
+          (insert "\n")))
+      (read-only-mode)
+      (spinner-stop))))
 
 (define-derived-mode bq-datasets-mode tablist-mode "BigQuery Datasets"
   "Mode for exploring the datasets in a project"
