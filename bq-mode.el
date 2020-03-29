@@ -108,13 +108,13 @@
   (-let* ((buffer "*BigQuery-Info*")
           (data-p (bq-get-entity-info id)))
     (switch-to-buffer buffer)
-    (org-mode)
+    (read-only-mode -1)
+    (erase-buffer)
+    (orgtbl-mode)
     (spinner-start 'progress-bar)
     (aio-await data-p)
-    (setq ng-data (funcall (aio-result data-p)))
     (condition-case err
         (-let* ((data (funcall (aio-result data-p)))
-                ;; _  (setq ng-data data)
                 (info-rows (cl-loop for elt in bq-info-keys
                                     when (condition-case _
                                              (apply 'ht-get* data (car elt))
@@ -124,17 +124,21 @@
                                       (list label (funcall f (apply 'ht-get* data ks)))))))
 
           (-when-let (desc (ht-get data "description"))
-            (insert "*Description*\n\n")
+            (insert (propertize "Description" 'face 'bold-italic))
+            (insert "\n\n")
             (insert desc)
             (insert "\n\n"))
 
           (-when-let (query (condition-case _
                                 (ht-get* data "view" "query")
                               (error nil)))
-            (insert "*View Query*\n\n")
-            (insert (-> (om-build-src-block :value query :language "sql") (om-to-trimmed-string)))
+            (insert (propertize "View Query" 'face 'bold-italic))
+            (insert "\n\n")
+            (insert query)
             (insert "\n\n"))
 
+          (insert (propertize "Information" 'face 'bold-italic))
+          (insert "\n\n")
           (->> (apply 'om-build-table! info-rows)
                (om-to-trimmed-string)
                (insert))
@@ -149,10 +153,13 @@
                                                 (ht-get elt "mode"))
                                           (append (-when-let (desc (ht-get elt "description"))
                                                     (list )desc))))))
+              (insert (propertize "Schema" 'face 'bold-italic))
+              (insert "\n\n")
               (->> (apply 'om-build-table! schema-rows)
-                        (om-to-trimmed-string)
-                        (insert))))
-
+                   (om-to-trimmed-string)
+                   (insert))
+              (insert "\n")))
+          (read-only-mode)
           (spinner-stop))
       (error (message "ERROR => %s" err)))
     ))
@@ -187,7 +194,7 @@
 
 (define-key bq-tables-mode-map (kbd "<return>") 'bq-entity-info-from-list)
 
-(defun bq-async-json-command (cmd)
+(defun bq-async-json-command (cmd &optional raw)
   "Get entity info as pretty text."
   (-let* ((temp-buffer "*BigQuery-Output*")
           (proc-name "*BigQuery-Output-Proc*")
@@ -199,7 +206,7 @@
                                   (switch-to-buffer temp-buffer)
                                   (-let* ((result-str (buffer-string))
                                           (json-object-type 'hash-table)
-                                          (result (json-read-from-string result-str)))
+                                          (result (if raw result-str (json-read-from-string result-str))))
                                     (aio-resolve promise (lambda () result))
                                     (kill-buffer)))))
         promise))
