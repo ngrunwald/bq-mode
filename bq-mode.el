@@ -5,9 +5,9 @@
 ;; Author: GRUNWALD Nils
 ;; URL: http://github.com/ngrunwald/ob-bigquery
 ;; Version: 0.1.0
-;; Package-Requires: ((spinner "1.7.3") (aio "") (om "")
-;;                    (ht "") (s ""))
-
+;; Package-Requires: ((spinner "1.7.3") (aio "1.0") (om "1.2.0")
+;;                    (ht "2.3") (s "1.12.0") (transient "0.2.0")
+;;                    (csv-mode "1.12"))
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
 ;; the Free Software Foundation, either version 3 of the License, or
@@ -33,23 +33,25 @@
 (require 'spinner)
 (require 'ht)
 (require 's)
+(require 'transient)
+(require 'csv-mode)
 
 (setq lexical-binding t)
 
 (aio-defun bq-get-datasets-list ()
   "Get the list of datasets in current project."
-  (-let* ((p-result (bq-async-json-command "bq --format=json ls --max_results=10000")))
+  (-let* ((p-result (bq-async-json-command "ls --max_results=10000")))
     (aio-await p-result)
     (funcall (aio-result p-result))))
 
 (aio-defun bq-get-tables-list (dataset)
   "Get the list of tables in given dataset."
-  (-let* ((p-result (bq-async-json-command (format "bq --format=json ls --max_results=10000 %s" dataset))))
+  (-let* ((p-result (bq-async-json-command (format "ls --max_results=10000 %s" dataset))))
     (aio-await p-result)
     (funcall (aio-result p-result))))
 
 (aio-defun bq-get-entity-info (id)
-  (-let* ((p-result (bq-async-json-command (format "bq --format=json show %s" id))))
+  (-let* ((p-result (bq-async-json-command (format "show %s" id))))
     (aio-await p-result)
     (funcall (aio-result p-result))))
 
@@ -89,19 +91,23 @@
                  (match-string 2 num))))
     num))
 
-(setq bq-info-keys
-      (list
-       `(("id") . ("Id" . identity))
-       `(("type") . ("Type" . identity))
-       `(("timePartitioning" "type") . ("Time Partitioning Type" . identity))
-       `(("view" "useLegacySql") . ("Use Legacy SQL" . identity))
-       `(("numRows") . ("Rows" . bq--add-number-grouping))
-       `(("numBytes") . ("Size" . bq--to-human-size))
-       `(("numLongTermBytes") . ("Long Term Size" . bq--to-human-size))
-       `(("creationTime") . ("Creation Time" . bq--format-date))
-       `(("lastModifiedTime") . ("Last Modified Time" . bq--format-date))
-       `(("location") . ("Location" . identity))))
+(defun bq--json-bool-to-string (x)
+  (if (eq :json-false x)
+      "false"
+    "true"))
 
+(defconst bq-info-keys
+  (list
+   `(("id") . ("Id" . identity))
+   `(("type") . ("Type" . identity))
+   `(("timePartitioning" "type") . ("Time Partitioning Type" . identity))
+   `(("view" "useLegacySql") . ("Use Legacy SQL" . bq--json-bool-to-string))
+   `(("numRows") . ("Rows" . bq--add-number-grouping))
+   `(("numBytes") . ("Size" . bq--to-human-size))
+   `(("numLongTermBytes") . ("Long Term Size" . bq--to-human-size))
+   `(("creationTime") . ("Creation Time" . bq--format-date))
+   `(("lastModifiedTime") . ("Last Modified Time" . bq--format-date))
+   `(("location") . ("Location" . identity))))
 
 (aio-defun bq-entity-info (id)
   (interactive)
@@ -113,53 +119,58 @@
     (orgtbl-mode)
     (spinner-start 'progress-bar)
     (aio-await data-p)
-    (-let* ((data (funcall (aio-result data-p)))
-            (info-rows (cl-loop for elt in bq-info-keys
-                                when (condition-case _
-                                         (apply 'ht-get* data (car elt))
-                                       (error nil))
-                                collect
-                                (-let [(ks . (label . f)) elt]
-                                  (list label (funcall f (apply 'ht-get* data ks)))))))
+    (condition-case err
+        (-let* ((data (funcall (aio-result data-p)))
+                (info-rows (cl-loop for elt in bq-info-keys
+                                    when (condition-case _
+                                             (apply 'ht-get* data (car elt))
+                                           (error nil))
+                                    collect
+                                    (-let [(ks . (label . f)) elt]
+                                      (list label (funcall f (apply 'ht-get* data ks)))))))
 
-      (-when-let (desc (ht-get data "description"))
-        (insert (propertize "Description" 'face 'bold-italic))
-        (insert "\n\n")
-        (insert desc)
-        (insert "\n\n"))
+          (-when-let (desc (ht-get data "description"))
+            (insert (propertize "Description" 'face 'bold-italic))
+            (insert "\n\n")
+            (insert desc)
+            (insert "\n\n"))
 
-      (-when-let (query (condition-case _
-                            (ht-get* data "view" "query")
-                          (error nil)))
-        (insert (propertize "View Query" 'face 'bold-italic))
-        (insert "\n\n")
-        (insert query)
-        (insert "\n\n"))
+          (-when-let (query (condition-case _
+                                (ht-get* data "view" "query")
+                              (error nil)))
+            (insert (propertize "View Query" 'face 'bold-italic))
+            (insert "\n\n")
+            (insert query)
+            (insert "\n\n"))
 
-      (insert (propertize "Information" 'face 'bold-italic))
-      (insert "\n\n")
-      (->> (apply 'om-build-table! info-rows)
-           (om-to-trimmed-string)
-           (insert))
-      (insert "\n\n")
-
-      (-when-let (schema (ht-get data "schema"))
-        (-let* ((fields (bq--analyze-schema schema))
-                (schema-rows (cl-loop for elt in fields
-                                      collect
-                                      (-> (list (s-join "." (ht-get elt "path"))
-                                                (ht-get elt "type")
-                                                (ht-get elt "mode"))
-                                          (append (-when-let (desc (ht-get elt "description"))
-                                                    (list )desc))))))
-          (insert (propertize "Schema" 'face 'bold-italic))
+          (insert (propertize "Information" 'face 'bold-italic))
           (insert "\n\n")
-          (->> (apply 'om-build-table! schema-rows)
+          (setq ng-data info-rows)
+          (->> (apply 'om-build-table! info-rows)
                (om-to-trimmed-string)
                (insert))
-          (insert "\n")))
-      (read-only-mode)
-      (spinner-stop))))
+          (insert "\n\n")
+
+          (-when-let (schema (ht-get data "schema"))
+            (-let* ((fields (bq--analyze-schema schema))
+                    (schema-rows (cl-loop for elt in fields
+                                          collect
+                                          (-> (list (s-join "." (ht-get elt "path"))
+                                                    (ht-get elt "type")
+                                                    (ht-get elt "mode"))
+                                              (append (-when-let (desc (ht-get elt "description"))
+                                                        (list desc)))))))
+              (insert (propertize "Schema" 'face 'bold-italic))
+              (insert "\n\n")
+              (->> (apply 'om-build-table! schema-rows)
+                   (om-to-trimmed-string)
+                   (insert))
+              (insert "\n")))
+          (read-only-mode)
+          (spinner-stop))
+      (error
+       (spinner-stop)
+       (message err)))))
 
 (define-derived-mode bq-datasets-mode tablist-mode "BigQuery Datasets"
   "Mode for exploring the datasets in a project"
@@ -191,22 +202,26 @@
 
 (define-key bq-tables-mode-map (kbd "<return>") 'bq-entity-info-from-list)
 
-(defun bq-async-json-command (cmd &optional raw)
+(defun bq-async-json-command (cmd &optional raw-format)
   "Get entity info as pretty text."
-  (-let* ((temp-buffer "*BigQuery-Output*")
-          (proc-name "*BigQuery-Output-Proc*")
-          (promise (aio-promise))
-          (proc (start-process-shell-command proc-name temp-buffer cmd)))
+  (condition-case err
+      (-let* ((temp-buffer "*BigQuery-Output*")
+              (proc-name "*BigQuery-Output-Proc*")
+              (promise (aio-promise))
+              (prefix (concat "bq --quiet --format=" (if raw-format raw-format "json") " "))
+              (command (concat prefix cmd))
+              (proc (start-process-shell-command proc-name temp-buffer (concat prefix cmd))))
         (set-process-sentinel proc
                               (lambda (process event)
                                 (save-excursion
                                   (switch-to-buffer temp-buffer)
                                   (-let* ((result-str (buffer-string))
                                           (json-object-type 'hash-table)
-                                          (result (if raw result-str (json-read-from-string result-str))))
+                                          (result (if raw-format result-str (json-read-from-string result-str))))
                                     (aio-resolve promise (lambda () result))
                                     (kill-buffer)))))
-        promise))
+        promise)
+    (error (message "ERR => %s"err))))
 
 (aio-defun bq-datasets ()
   (interactive)
@@ -239,26 +254,72 @@
   (-let ((id (tabulated-list-get-id)))
     (bq-entity-info id)))
 
-(defun bq-send-region (start end)
-  (interactive)
-  (-let* ((query (buffer-substring-no-properties start end))
-          (proc (start-process-shell-command
-                 "*bq-query*" "*BigQuery-Results*"
-                 (format "bq --quiet --format=pretty query '%s'" query))))
-    (switch-to-buffer "*BigQuery-Results*")
-    (spinner-start 'progress-bar)
-    (set-process-sentinel proc (lambda (process event) (spinner-stop)))))
+(defconst bq-query-processors
+  (ht ("--output=json" (ht (:format "prettyjson")
+                           (:renderer 'insert)
+                           (:mode 'json-mode)))
+      ("--output=table" (ht (:format "pretty")
+                            (:renderer 'insert)
+                            (:mode 'orgtbl-mode)))
+      ("--output=csv" (ht (:format "csv")
+                          (:renderer 'insert)
+                          (:mode 'csv-mode)))))
 
-(defun bq-send-paragraph ()
-  "Send the current paragraph to Big Query"
-  (interactive)
+(define-transient-command bq-query-transient ()
+  "Sends an SQL query to Big Query."
+  ["Arguments"
+   ("-l" "Do not use Legacy SQL" "--nouse_legacy_sql")
+   ("-L" "Allow Large Results" "--allow_large_results")
+   (bq-query:--output)
+   ("-F" "Do not Flatten Results" "--noflatten_results")
+   ("-b" "Batch Mode" "--batch")
+   ("-n" "Max Number of Rows" "--max_rows=")
+   ("-s" "Starting Row" "--start_row=")]
+  ["Actions"
+   ("r" "Query" bq-send-paragraph)])
+
+(define-infix-argument bq-query:--output ()
+  :description "Output Format"
+  :class 'transient-option
+  :key "-o"
+  :argument "--output="
+  :choices '("json" "table" "csv"))
+
+(aio-defun bq-send-region (start end args)
+  (condition-case err
+      (-let* ((query (buffer-substring-no-properties start end))
+              (pass-options (-remove (lambda (x) (s-matches? "--output=" x)) args))
+              (output (or (car (-filter (lambda (x) (s-matches? "--output=" x)) args))
+                          (if (member "--nouse_legacy_sql" args)
+                              "--output=json"
+                            "--output=table")))
+              (p-result (bq-async-json-command (format "query %s '%s'" (s-join " " pass-options) query)
+                                               (ht-get* bq-query-processors output :format))))
+        (switch-to-buffer "*BigQuery-Results*")
+        (read-only-mode -1)
+        (erase-buffer)
+        (funcall (ht-get* bq-query-processors output :mode))
+        (spinner-start 'progress-bar)
+        (aio-await p-result)
+        (-let ((result (funcall (aio-result p-result))))
+          (save-excursion
+            (switch-to-buffer "*BigQuery-Results*")
+            (funcall (ht-get* bq-query-processors output :renderer) result)
+            (spinner-stop)
+            (read-only-mode))))
+    (error (message "ERR => %s" err))))
+
+(defun bq-send-paragraph (&optional args)
+  "Send the current paragraph to Big Query, getting ARGS from transient."
+  (interactive
+   (list (transient-args 'bq-query-transient)))
   (let ((start (save-excursion
                  (backward-paragraph)
                  (point)))
         (end (save-excursion
                (forward-paragraph)
                (point))))
-    (bq-send-region start end)))
+    (bq-send-region start end args)))
 
 (provide 'bq-mode)
-;;; bigquery-mode ends here
+;;; bq-mode ends here
