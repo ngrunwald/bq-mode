@@ -7,7 +7,7 @@
 ;; Version: 0.1.0
 ;; Package-Requires: ((spinner "1.7.3") (aio "1.0") (om "1.2.0")
 ;;                    (ht "2.3") (s "1.12.0") (transient "0.2.0")
-;;                    (csv-mode "1.12") (company "") (pcache ""))
+;;                    (csv-mode "1.12") (company "0.9.12") (pcache "0.4.2"))
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
 ;; the Free Software Foundation, either version 3 of the License, or
@@ -37,6 +37,8 @@
 (require 'csv-mode)
 (require 'company)
 (require 'pcache)
+(require 'seq)
+(require 'cl-lib)
 
 (setq lexical-binding t)
 
@@ -130,9 +132,9 @@
 
 (defun bq--format-date (d)
   (-> d
-       (string-to-number)
-       (/ 1000)
-       ((lambda (x) (format-time-string "%F %T" x)))))
+      (string-to-number)
+      (/ 1000)
+      ((lambda (x) (format-time-string "%F %T" x)))))
 
 (defun bq--add-number-grouping (num &optional separator)
   "Add commas to NUMBER and return it as a string.
@@ -269,6 +271,8 @@
   "Mode for writing and executing Big Query queries."
   )
 
+(define-key bq-tables-mode-map (kbd "<tab>") 'company-complete)
+
 (defun bq-async-json-command (cmd &optional raw-format)
   "Get entity info as pretty text."
   (condition-case err
@@ -394,6 +398,8 @@
                (point))))
     (bq-send-region start end args)))
 
+
+
 (defun bq-process-completion-candidates (candidates)
   (seq-mapcat
    (lambda (cand)
@@ -401,15 +407,27 @@
              (str-key (symbol-name cache-key)))
        (cond
         ((s-prefix? "bq-table--" str-key)
-         (-let ((name (ht-get data "name"))
-                (table (ht-get data "table")))
-           (list name
-                 (concat table "." name))))
+         (-let* ((name (ht-get data "name"))
+                 (table (ht-get data "table"))
+                 (dataset (ht-get data "dataset"))
+                 (description (ht-get data "description"))
+                 (mode (ht-get data "mode"))
+                 (type (if (string= mode "REPEATED")
+                           (concat mode " " (ht-get data "type"))
+                         (ht-get data "type"))))
+           (list (propertize name
+                             'annotation (format " [%s] <= %s.%s" type dataset table)
+                             'meta description)
+                 (propertize (concat table "." name)
+                             'annotation (format " [%s] <= %s" type dataset)
+                             'meta description))))
         ((s-prefix? "bq-dataset--" str-key)
          (let ((table (ht-get* data "tableReference" "tableId"))
                (dataset (ht-get* data "tableReference" "datasetId")))
-           (list table
-                 (concat dataset "." table)))))))
+           (list (propertize table
+                             'annotation (format " [TABLE] <= %s" dataset))
+                 (propertize (concat dataset "." table)
+                             'annotation " [TABLE]")))))))
    candidates))
 
 (defun bq-query-completions-candidates (&optional project)
@@ -439,8 +457,11 @@
     (candidates
      (progn
        (remove-if-not
-        (lambda (c) (string-prefix-p arg c))
-        (bq-query-completions-candidates))))))
+        (lambda (c) (string-prefix-p (downcase arg) c))
+        (bq-query-completions-candidates))))
+    (annotation (get-text-property 0 'annotation arg))
+    (meta (get-text-property 0 'meta arg))
+    (ignore-case t)))
 
 (add-to-list 'company-backends 'company-bq-query-backend)
 
