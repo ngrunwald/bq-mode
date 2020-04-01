@@ -7,7 +7,7 @@
 ;; Version: 0.1.0
 ;; Package-Requires: ((spinner "1.7.3") (aio "1.0") (om "1.2.0")
 ;;                    (ht "2.3") (s "1.12.0") (transient "0.2.0")
-;;                    (csv-mode "1.12"))
+;;                    (csv-mode "1.12") (company "") (pcache ""))
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
 ;; the Free Software Foundation, either version 3 of the License, or
@@ -35,20 +35,67 @@
 (require 's)
 (require 'transient)
 (require 'csv-mode)
+(require 'company)
+(require 'pcache)
 
 (setq lexical-binding t)
 
-(aio-defun bq-get-datasets-list ()
-  "Get the list of datasets in current project."
-  (-let* ((p-result (bq-async-json-command "ls --max_results=10000")))
-    (aio-await p-result)
-    (funcall (aio-result p-result))))
+(setq bq-cache-obarray (make-vector 100000 0))
 
-(aio-defun bq-get-tables-list (dataset)
-  "Get the list of tables in given dataset."
-  (-let* ((p-result (bq-async-json-command (format "ls --max_results=10000 %s" dataset))))
-    (aio-await p-result)
-    (funcall (aio-result p-result))))
+(defun bq-get-current-project ()
+  (-let ((project (car (cdr (s-split "\n" (shell-command-to-string "gcloud config get-value project"))))))
+    (setq bq-current-project project)
+    project))
+
+(defun bq-project-cache-repo (project)
+  (pcache-repository (concat "bq-" project)))
+
+(setq bq-current-project nil)
+
+(defun bq-clear-cache (&optional project)
+  (interactive)
+  (pcache-destroy-repository (concat "bq-" (or project (bq-get-current-project)))))
+
+(defconst list-processors
+  (ht (:datasets (ht (:format-fn (lambda (&optional project &rest _)
+                                   (format "ls --project_id=%s --max_results=10000"
+                                           (or project (bq-get-current-project)))))
+                     (:cache-key-fn (lambda (&rest _) (intern "bq-datasets" bq-cache-obarray)))))
+      (:tables (ht (:format-fn (lambda (project dataset &rest _)
+                                 (format "ls --project_id=%s --max_results=10000 %s"
+                                         (or project (bq-get-current-project))
+                                         dataset)))
+                   (:cache-key-fn (lambda (dataset &rest _)
+                                    (intern (format "bq-dataset--"
+                                                    (bq-remove-project dataset))
+                                            bq-cache-obarray)))))
+      (:projects (ht (:format-fn (lambda (&rest _)
+                                   "ls -p --max_results=10000"))
+                     (:cache-key-fn (lambda (&rest _) (intern "bq-projects"
+                                                              bq-cache-obarray)))))))
+
+(defun bq-remove-project (id)
+  (s-replace-regexp "^[^:]+:" "" id))
+
+(defun bq-extract-project (id)
+  (elt (s-match "^\\([^:]+\\):" id) 1))
+
+(aio-defun bq-get-entities-list (req-type &optional project dataset refresh)
+  "Get the list of entities in current project."
+  (-let* ((procs (ht-get list-processors req-type))
+          (current-project (or project
+                               (if refresh
+                                   (bq-get-current-project)
+                                 (or bq-current-project (bq-get-current-project)))))
+          (cache-key (funcall (ht-get procs :cache-key-fn) dataset))
+          (from-cache (pcache-get (bq-project-cache-repo current-project) cache-key)))
+    (if (and from-cache (not refresh))
+        from-cache
+      (-let* ((p-result (bq-async-json-command (funcall (ht-get procs :format-fn) current-project dataset)))
+              (_ (aio-await p-result))
+              (data (funcall (aio-result p-result))))
+        (pcache-put (bq-project-cache-repo current-project) cache-key data)
+        data))))
 
 (aio-defun bq-get-entity-info (id)
   (-let* ((p-result (bq-async-json-command (format "show %s" id))))
@@ -112,7 +159,10 @@
 (aio-defun bq-entity-info (id)
   (interactive)
   (-let* ((buffer "*BigQuery-Info*")
-          (data-p (bq-get-entity-info id)))
+          (data-p (bq-get-entity-info id))
+          (project (or (bq-extract-project id)
+                       bq-current-project
+                       (bq-get-current-project))))
     (switch-to-buffer buffer)
     (read-only-mode -1)
     (erase-buffer)
@@ -166,7 +216,11 @@
                 (->> (apply 'om-build-table! schema-rows)
                      (om-to-trimmed-string)
                      (insert))
-                (insert "\n")))
+                (insert "\n")
+                (pcache-put (bq-project-cache-repo project)
+                            (intern (format "bq-table--%s" (bq-remove-project id))
+                                    bq-cache-obarray)
+                            fields)))
             (read-only-mode)
             (spinner-stop)))
       (error
@@ -231,7 +285,7 @@
     (setq bq-current-datasets-list '())
     (bq-datasets-mode)
     (spinner-start 'progress-bar)
-    (-let ((p-datasets (bq-get-datasets-list)))
+    (-let ((p-datasets (bq-get-entities-list :datasets)))
       (aio-await p-datasets)
       (save-excursion
         (switch-to-buffer buffer)
@@ -247,7 +301,7 @@
     (setq bq-current-tables-list '())
     (bq-tables-mode)
     (spinner-start 'progress-bar)
-    (-let ((p-tables (bq-get-tables-list id)))
+    (-let ((p-tables (bq-get-entities-list :tables nil id)))
       (aio-await p-tables)
       (save-excursion
         (switch-to-buffer buffer)
