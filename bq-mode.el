@@ -40,7 +40,7 @@
 
 (setq lexical-binding t)
 
-(setq bq-cache-obarray (make-vector 100000 0))
+(defconst bq-cache-obarray (make-vector 100000 0))
 
 (defun bq-get-current-project ()
   (-let ((project (car (cdr (s-split "\n" (shell-command-to-string "gcloud config get-value project"))))))
@@ -66,7 +66,7 @@
                                          (or project (bq-get-current-project))
                                          dataset)))
                    (:cache-key-fn (lambda (dataset &rest _)
-                                    (intern (format "bq-dataset--"
+                                    (intern (format "bq-dataset--%s"
                                                     (bq-remove-project dataset))
                                             bq-cache-obarray)))))
       (:projects (ht (:format-fn (lambda (&rest _)
@@ -110,11 +110,18 @@
   (-let* ((nam (ht-get f-spec "name"))
           (current (bq--set f-spec "path" (append path (list nam)))))
     (-if-let (fields (ht-get f-spec "fields"))
-        (append (list current) (-mapcat (lambda (f) (bq--analyze-field f (append path (list nam)))) fields))
+        (append (list current)
+                (-mapcat
+                 (lambda (f)
+                   (bq--analyze-field f (append path (list nam))))
+                 fields))
       (list current))))
 
-(defun bq--analyze-schema (s)
-  (-mapcat 'bq--analyze-field (ht-get s "fields")))
+(defun bq--analyze-schema (dataset table s)
+  (->> (ht-get s "fields")
+       (-mapcat 'bq--analyze-field)
+       (--map (bq--set it "dataset" dataset))
+       (--map (bq--set it "table" table))))
 
 (defun bq--to-human-size (x)
   (-> x
@@ -171,6 +178,8 @@
     (aio-await data-p)
     (condition-case err
         (-let* ((data (funcall (aio-result data-p)))
+                (table-id (ht-get* data "tableReference" "tableId"))
+                (dataset-id (ht-get* data "tableReference" "datasetId"))
                 (info-rows (cl-loop for elt in bq-info-keys
                                     when (condition-case _
                                              (apply 'ht-get* data (car elt))
@@ -178,7 +187,6 @@
                                     collect
                                     (-let [(ks . (label . f)) elt]
                                       (list label (funcall f (apply 'ht-get* data ks)))))))
-
           (save-excursion
             (switch-to-buffer buffer)
             (-when-let (desc (ht-get data "description"))
@@ -203,7 +211,7 @@
             (insert "\n\n")
 
             (-when-let (schema (ht-get data "schema"))
-              (-let* ((fields (bq--analyze-schema schema))
+              (-let* ((fields (bq--analyze-schema dataset-id table-id schema))
                       (schema-rows (cl-loop for elt in fields
                                             collect
                                             (-> (list (s-join "." (ht-get elt "path"))
@@ -256,6 +264,10 @@
     (tabulated-list-print)))
 
 (define-key bq-tables-mode-map (kbd "<return>") 'bq-entity-info-from-list)
+
+(define-derived-mode bq-query-mode prog-mode "BigQuery Query"
+  "Mode for writing and executing Big Query queries."
+  )
 
 (defun bq-async-json-command (cmd &optional raw-format)
   "Get entity info as pretty text."
@@ -381,6 +393,56 @@
                (forward-paragraph)
                (point))))
     (bq-send-region start end args)))
+
+(defun bq-process-completion-candidates (candidates)
+  (seq-mapcat
+   (lambda (cand)
+     (-let* (((cache-key . data) cand)
+             (str-key (symbol-name cache-key)))
+       (cond
+        ((s-prefix? "bq-table--" str-key)
+         (-let ((name (ht-get data "name"))
+                (table (ht-get data "table")))
+           (list name
+                 (concat table "." name))))
+        ((s-prefix? "bq-dataset--" str-key)
+         (let ((table (ht-get* data "tableReference" "tableId"))
+               (dataset (ht-get* data "tableReference" "datasetId")))
+           (list table
+                 (concat dataset "." table)))))))
+   candidates))
+
+(defun bq-query-completions-candidates (&optional project)
+    (-let ((values (list)))
+      (pcache-map
+       (bq-project-cache-repo (or project
+                                  bq-current-project
+                                  (bq-get-current-project)))
+       (lambda (k entry)
+         (when (not (string= "bq-datasets" (symbol-name k)))
+           (-let ((v (oref entry :value)))
+             (seq-doseq (elt v)
+               (push `(,k . ,elt) values))))))
+      (-> values
+          (bq-process-completion-candidates))))
+
+
+(bq-query-completions-candidates)
+(pcache-get (bq-project-cache-repo "oscaro-cloud") (intern "bq-dataset--" bq-cache-obarray))
+
+(defun company-bq-query-backend (command &optional arg &rest _)
+  (interactive (list 'interactive))
+  (case command
+    (interactive (company-begin-backend 'company-bq-query-backend))
+    (prefix (and (eq major-mode 'bq-query-mode)
+                 (company-grab-symbol)))
+    (candidates
+     (progn
+       (remove-if-not
+        (lambda (c) (string-prefix-p arg c))
+        (bq-query-completions-candidates))))))
+
+(add-to-list 'company-backends 'company-bq-query-backend)
 
 (provide 'bq-mode)
 ;;; bq-mode ends here
