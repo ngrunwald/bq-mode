@@ -42,8 +42,6 @@
 
 (setq lexical-binding t)
 
-(defconst bq-cache-obarray (make-vector 100000 0))
-
 (defun bq-get-current-project ()
   (-let ((project (car (cdr (s-split "\n" (shell-command-to-string "gcloud config get-value project"))))))
     (setq bq-current-project project)
@@ -62,25 +60,29 @@
   (ht (:datasets (ht (:format-fn (lambda (&optional project &rest _)
                                    (format "ls --project_id=%s --max_results=10000"
                                            (or project (bq-get-current-project)))))
-                     (:cache-key-fn (lambda (&rest _) (intern "bq-datasets" bq-cache-obarray)))))
+                     (:cache-key-fn (lambda (&rest _) (intern "--bq-datasets")))))
       (:tables (ht (:format-fn (lambda (project dataset &rest _)
                                  (format "ls --project_id=%s --max_results=10000 %s"
                                          (or project (bq-get-current-project))
                                          dataset)))
                    (:cache-key-fn (lambda (dataset &rest _)
-                                    (intern (format "bq-dataset--%s"
-                                                    (bq-remove-project dataset))
-                                            bq-cache-obarray)))))
+                                    (intern (format "--bq-dataset--%s"
+                                                    (bq-remove-project dataset)))))))
       (:projects (ht (:format-fn (lambda (&rest _)
                                    "ls -p --max_results=10000"))
-                     (:cache-key-fn (lambda (&rest _) (intern "bq-projects"
-                                                              bq-cache-obarray)))))))
+                     (:cache-key-fn (lambda (&rest _) (intern "--bq-projects")))))))
 
 (defun bq-remove-project (id)
   (s-replace-regexp "^[^:]+:" "" id))
 
 (defun bq-extract-project (id)
   (elt (s-match "^\\([^:]+\\):" id) 1))
+
+(defun bq-remove-dataset (id)
+  (s-replace-regexp "^[^\.]+\." "" id))
+
+(defun bq-extract-dataset (id)
+  (elt (s-match "^\\([^\.]+\\)\." id) 1))
 
 (aio-defun bq-get-entities-list (req-type &optional project dataset refresh)
   "Get the list of entities in current project."
@@ -228,8 +230,7 @@
                      (insert))
                 (insert "\n")
                 (pcache-put (bq-project-cache-repo project)
-                            (intern (format "bq-table--%s" (bq-remove-project id))
-                                    bq-cache-obarray)
+                            (intern (format "--bq-table--%s" (bq-remove-project id)))
                             fields)))
             (read-only-mode)
             (spinner-stop)))
@@ -267,9 +268,18 @@
 
 (define-key bq-tables-mode-map (kbd "<return>") 'bq-entity-info-from-list)
 
-(define-derived-mode bq-query-mode prog-mode "BigQuery Query"
+(defvar bq-query-mode-syntax-table nil "Syntax table for `bq-query-mode'.")
+
+(setq bq-query-mode-syntax-table
+      (let ( (syn-table (make-syntax-table)))
+        (modify-syntax-entry ?. "_" syn-table)
+        (modify-syntax-entry ?: "_" syn-table)
+        syn-table))
+
+
+(define-derived-mode bq-query-mode sql-mode "BigQuery Query"
   "Mode for writing and executing Big Query queries."
-  )
+  (set-syntax-table bq-query-mode-syntax-table))
 
 (define-key bq-tables-mode-map (kbd "<tab>") 'company-complete)
 
@@ -398,67 +408,96 @@
                (point))))
     (bq-send-region start end args)))
 
+(defun bq--table-context-p ()
+  (interactive)
+  (save-excursion
+    (while (not (or (char-equal (char-before) ?\n)
+                    (char-equal (char-before) ?\s)))
+        (backward-char))
+    (-let ((case-fold-search t))
+      (or (looking-back "\\bfrom[\s\n]+" 10 t)
+          (looking-back "\\bjoin[\s\n]+" 10 t)
+          (looking-back "\\bunnest([\s\n]+" 10 t)))))
 
-
-(defun bq-process-completion-candidates (candidates)
+(defun bq-query-completions-fields-candidates (tables)
   (seq-mapcat
-   (lambda (cand)
-     (-let* (((cache-key . data) cand)
-             (str-key (symbol-name cache-key)))
-       (cond
-        ((s-prefix? "bq-table--" str-key)
-         (-let* ((name (ht-get data "name"))
-                 (table (ht-get data "table"))
-                 (dataset (ht-get data "dataset"))
-                 (description (ht-get data "description"))
-                 (mode (ht-get data "mode"))
-                 (type (if (string= mode "REPEATED")
-                           (concat mode " " (ht-get data "type"))
-                         (ht-get data "type"))))
-           (list (propertize name
-                             'annotation (format " [%s] <= %s.%s" type dataset table)
-                             'meta description)
-                 (propertize (concat table "." name)
-                             'annotation (format " [%s] <= %s" type dataset)
-                             'meta description))))
-        ((s-prefix? "bq-dataset--" str-key)
-         (let ((table (ht-get* data "tableReference" "tableId"))
-               (dataset (ht-get* data "tableReference" "datasetId")))
-           (list (propertize table
-                             'annotation (format " [TABLE] <= %s" dataset))
-                 (propertize (concat dataset "." table)
-                             'annotation " [TABLE]")))))))
-   candidates))
-
-(defun bq-query-completions-candidates (&optional project)
-    (-let ((values (list)))
-      (pcache-map
-       (bq-project-cache-repo (or project
-                                  bq-current-project
-                                  (bq-get-current-project)))
-       (lambda (k entry)
-         (when (not (string= "bq-datasets" (symbol-name k)))
-           (-let ((v (oref entry :value)))
-             (seq-doseq (elt v)
-               (push `(,k . ,elt) values))))))
-      (-> values
-          (bq-process-completion-candidates))))
+   (lambda (table)
+     (-let ((data (pcache-get (bq-project-cache-repo (or bq-current-project
+                                                            (bq-get-current-project)))
+                                 (intern (format "--bq-table--%s" table)))))
+       (when data
+           (--mapcat (-let* ((name (s-join "." (ht-get it "path")))
+                             (dataset (ht-get it "dataset"))
+                             (description (ht-get it "description"))
+                             (mode (ht-get it "mode"))
+                             (type (if (string= mode "REPEATED")
+                                       (concat mode " " (ht-get it "type"))
+                                     (ht-get it "type"))))
+                       (when (not (string= "RECORD" (ht-get it "type")))
+                         (list (propertize name
+                                           'annotation (format " [%s] <= %s" type table)
+                                           'meta description)
+                               (propertize (concat (bq-remove-dataset table) "." name)
+                                           'annotation (format " [%s] <= %s" type dataset)
+                                           'meta description))))
+                     data))))
+   tables))
 
 
-(bq-query-completions-candidates)
-(pcache-get (bq-project-cache-repo "oscaro-cloud") (intern "bq-dataset--" bq-cache-obarray))
+;; (pcache-get (bq-project-cache-repo (or bq-current-project
+;;                                        (bq-get-current-project)))
+;;             (intern (format "--bq-table--%s" "catalolo.product")))
+
+;; (bq-query-completions-fields-candidates (list "curiosity.availabilities"))
+
+(defun bq-query-completions-datasets-candidates (&optional project)
+  (-let ((data (pcache-get (bq-project-cache-repo (or project
+                                                      bq-current-project
+                                                      (bq-get-current-project)))
+                           (intern "--bq-datasets"))))
+    (--map (-> it
+               (ht-get* "datasetReference" "datasetId")
+               (concat ".")
+               (propertize 'annotation " [DATASET]"))
+           data)))
+
+(defun bq-query-completions-tables-candidates (dataset)
+  (-let ((data (pcache-get (bq-project-cache-repo (or bq-current-project
+                                                      (bq-get-current-project)))
+                           (intern (format "--bq-dataset--%s" (bq-remove-project dataset))))))
+    (--map (-> (format "%s.%s"
+                       (ht-get* it "tableReference" "datasetId")
+                       (ht-get* it "tableReference" "tableId"))
+               (propertize 'annotation " [TABLE]"))
+           data)))
+
+(defun bq-find-used-tables ()
+  (-let ((text (buffer-string)))
+    (--map (seq-elt it 1)
+           (s-match-strings-all "\\(?:join\\|from\\)\s+`?\\(\[^\s`,\n\]+\\)"
+                                text))))
 
 (defun company-bq-query-backend (command &optional arg &rest _)
   (interactive (list 'interactive))
   (case command
     (interactive (company-begin-backend 'company-bq-query-backend))
     (prefix (and (eq major-mode 'bq-query-mode)
-                 (company-grab-symbol)))
+                 (if (bq--table-context-p)
+                     (propertize (company-grab-symbol)
+                                 'context 'table)
+                   (propertize (company-grab-symbol)
+                               'context 'field))))
     (candidates
      (progn
+       (message "prefix => %s %s"  arg (get-text-property 0 'context arg))
        (remove-if-not
         (lambda (c) (string-prefix-p (downcase arg) c))
-        (bq-query-completions-candidates))))
+        (if (eql 'table (get-text-property 0 'context arg))
+            (if (s-contains? "." arg)
+                (bq-query-completions-tables-candidates (bq-extract-dataset arg))
+              (bq-query-completions-datasets-candidates))
+          (-let ((tables (bq-find-used-tables)))
+            (bq-query-completions-fields-candidates tables))))))
     (annotation (get-text-property 0 'annotation arg))
     (meta (get-text-property 0 'meta arg))
     (ignore-case t)))
