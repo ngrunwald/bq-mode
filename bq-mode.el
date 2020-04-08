@@ -1,4 +1,4 @@
-;;; bq-mode.el --- Major mode for Google Big Query
+;;; bq-mode.el --- Major mode for Google Big Query -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2020 Nils Grunwald
 
@@ -40,8 +40,6 @@
 (require 'seq)
 (require 'cl-lib)
 
-(setq lexical-binding t)
-
 (defun bq-get-current-project ()
   (-let ((project (car (cdr (s-split "\n" (shell-command-to-string "gcloud config get-value project"))))))
     (setq bq-current-project project)
@@ -50,7 +48,7 @@
 (defun bq-project-cache-repo (project)
   (pcache-repository (concat "bq-" project)))
 
-(setq bq-current-project nil)
+(defvar bq-current-project nil)
 
 (defun bq-clear-cache (&optional project)
   (interactive)
@@ -238,8 +236,11 @@
        (spinner-stop)
        (message err)))))
 
+;; (bq-entity-info "daily_addiary.addiary_pt")
+
 (define-derived-mode bq-datasets-mode tablist-mode "BigQuery Datasets"
   "Mode for exploring the datasets in a project"
+  :group 'bq-mode
   (-let ((columns [("Dataset" 50 t) ("Location" 20 t)])
          (rows (-map (lambda (it)
                        `(,(ht-get it "id") [,(ht-get* it "datasetReference" "datasetId")
@@ -255,6 +256,7 @@
 
 (define-derived-mode bq-tables-mode tablist-mode "BigQuery Tables"
   "Mode for exploring the tables in a dataset"
+  :group 'bq-mode
   (-let ((columns [("Table" 50 t) ("Type" 30 t) ("Creation Date" 30 t)])
          (rows (-map (lambda (it)
                        `(,(ht-get it "id") [,(ht-get* it "tableReference" "tableId")
@@ -268,18 +270,13 @@
 
 (define-key bq-tables-mode-map (kbd "<return>") 'bq-entity-info-from-list)
 
-(defvar bq-query-mode-syntax-table nil "Syntax table for `bq-query-mode'.")
-
-(setq bq-query-mode-syntax-table
-      (let ( (syn-table (make-syntax-table)))
-        (modify-syntax-entry ?. "_" syn-table)
-        (modify-syntax-entry ?: "_" syn-table)
-        syn-table))
-
-
 (define-derived-mode bq-query-mode sql-mode "BigQuery Query"
   "Mode for writing and executing Big Query queries."
-  (set-syntax-table bq-query-mode-syntax-table))
+  :group 'bq-mode
+  (setq comment-start "--")
+  (setq comment-end "")
+  (modify-syntax-entry ?. "_")
+  (modify-syntax-entry ?: "_"))
 
 (define-key bq-tables-mode-map (kbd "<tab>") 'company-complete)
 
@@ -474,7 +471,7 @@
 (defun bq-find-used-tables ()
   (-let ((text (buffer-string)))
     (--map (seq-elt it 1)
-           (s-match-strings-all "\\(?:join\\|from\\)\s+`?\\(\[^\s`,\n\]+\\)"
+           (s-match-strings-all "\\(?:join\\|from\\)\s+`?\\(\\(?:\\s_\\|\\w\\)+\\)"
                                 text))))
 
 (defun company-bq-query-backend (command &optional arg &rest _)
@@ -497,6 +494,7 @@
                 (bq-query-completions-tables-candidates (bq-extract-dataset arg))
               (bq-query-completions-datasets-candidates))
           (-let ((tables (bq-find-used-tables)))
+            (message "used tables: %s" tables)
             (bq-query-completions-fields-candidates tables))))))
     (annotation (get-text-property 0 'annotation arg))
     (meta (get-text-property 0 'meta arg))
