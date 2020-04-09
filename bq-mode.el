@@ -458,8 +458,9 @@
 (defun bq--table-context-p ()
   (interactive)
   (save-excursion
-    (while (not (or (char-equal (char-before) ?\n)
-                    (char-equal (char-before) ?\s)))
+    (while (and (char-before)
+                (not (or (char-equal (char-before) ?\n)
+                         (char-equal (char-before) ?\s))))
       (backward-char))
     (-let ((case-fold-search t)
            (distance (min 10 (- (point) (point-min)))))
@@ -553,8 +554,8 @@
   (interactive (list 'interactive))
   (case command
     (interactive (progn
-                   (bq-precache-buffer)
-                   (company-begin-backend 'company-bq-query-backend)))
+                   (company-begin-backend 'company-bq-query-backend)
+                   (bq-precache-buffer)))
     (prefix (and (eq major-mode 'bq-query-mode)
                  (if (bq--table-context-p)
                      (propertize (company-grab-symbol)
