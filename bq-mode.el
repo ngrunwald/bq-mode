@@ -369,9 +369,14 @@
     (bq-entity-info id)))
 
 (defun bq-start-query (table-id)
-  (switch-to-buffer (format "BQ-%s" table-id))
-  (bq-query-mode)
-  (insert (format "SELECT * FROM `%s`;" table-id)))
+  (-let ((buffer (format "BQ-%s" table-id)))
+    (if (buffer-live-p (get-buffer buffer))
+        (switch-to-buffer buffer)
+      (progn
+        (switch-to-buffer buffer)
+        (bq-query-mode)
+        (insert (format "SELECT  FROM `%s`;" table-id))
+        (move-to-column 7)))))
 
 (defun bq-query-from-list ()
   ""
