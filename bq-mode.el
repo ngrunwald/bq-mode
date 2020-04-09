@@ -82,7 +82,7 @@
 (defun bq-extract-dataset (id)
   (elt (s-match "^\\([^\.]+\\)\." id) 1))
 
-(aio-defun bq-get-entities-list (req-type &optional project dataset refresh)
+(aio-defun bq-get-entities-list (req-type &optional project dataset refresh drop-results)
   "Get the list of entities in current project."
   (-let* ((procs (ht-get list-processors req-type))
           (current-project (or project
@@ -90,14 +90,18 @@
                                    (bq-get-current-project)
                                  (or bq-current-project (bq-get-current-project)))))
           (cache-key (funcall (ht-get procs :cache-key-fn) dataset))
-          (from-cache (pcache-get (bq-project-cache-repo current-project) cache-key)))
+          (from-cache (if drop-results
+                          (pcache-has (bq-project-cache-repo current-project) cache-key)
+                          (pcache-get (bq-project-cache-repo current-project) cache-key))))
     (if (and from-cache (not refresh))
         from-cache
       (-let* ((p-result (bq-async-json-command (funcall (ht-get procs :format-fn) current-project dataset)))
               (_ (aio-await p-result))
               (data (funcall (aio-result p-result))))
         (pcache-put (bq-project-cache-repo current-project) cache-key data)
-        data))))
+        (if drop-results
+            f
+            data)))))
 
 (aio-defun bq-get-entity-info (id)
   (-let* ((p-result (bq-async-json-command (format "show %s" id))))
@@ -152,6 +156,10 @@
       "false"
     "true"))
 
+(define-derived-mode bq-info-mode special-mode "BigQuery Info"
+  "Mode for displaying Info on entities"
+  (orgtbl-mode))
+
 (defconst bq-info-keys
   (list
    `(("id") . ("Id" . identity))
@@ -165,6 +173,27 @@
    `(("lastModifiedTime") . ("Last Modified Time" . bq--format-date))
    `(("location") . ("Location" . identity))))
 
+(aio-defun bq-get-table-fields (id &optional refresh drop-results)
+  (-let* ((cache-key (intern (format "--bq-table--%s" (bq-remove-project id))))
+          (project (or bq-current-project
+                       (bq-get-current-project)))
+          (from-cache (if drop-results
+                          (pcache-has (bq-project-cache-repo project) cache-key)
+                        (pcache-get (bq-project-cache-repo project) cache-key))))
+    (if (and from-cache (not refresh))
+        from-cache
+      (-let* ((p-result (bq-get-entity-info id))
+              (_ (aio-await p-result))
+              (data (funcall (aio-result p-result)))
+              (table-id (ht-get* data "tableReference" "tableId"))
+              (dataset-id (ht-get* data "tableReference" "datasetId"))
+              (schema (ht-get data "schema"))
+              (fields (bq--analyze-schema dataset-id table-id schema)))
+        (pcache-put (bq-project-cache-repo project) cache-key fields)
+        (if drop-results
+            f
+          fields)))))
+
 (aio-defun bq-entity-info (id)
   (interactive)
   (-let* ((buffer "*BigQuery-Info*")
@@ -173,9 +202,9 @@
                        bq-current-project
                        (bq-get-current-project))))
     (switch-to-buffer buffer)
+    (bq-info-mode)
     (read-only-mode -1)
     (erase-buffer)
-    (orgtbl-mode)
     (spinner-start 'progress-bar)
     (aio-await data-p)
     (condition-case err
@@ -269,6 +298,7 @@
     (tabulated-list-print)))
 
 (define-key bq-tables-mode-map (kbd "<return>") 'bq-entity-info-from-list)
+(define-key bq-tables-mode-map (kbd "r") 'bq-query-from-list)
 
 (define-derived-mode bq-query-mode sql-mode "BigQuery Query"
   "Mode for writing and executing Big Query queries."
@@ -337,6 +367,17 @@
   (interactive)
   (-let ((id (tabulated-list-get-id)))
     (bq-entity-info id)))
+
+(defun bq-start-query (table-id)
+  (switch-to-buffer (format "BQ-%s" table-id))
+  (bq-query-mode)
+  (insert (format "SELECT * FROM `%s`;" table-id)))
+
+(defun bq-query-from-list ()
+  ""
+  (interactive)
+  (-let ((id (tabulated-list-get-id)))
+    (bq-start-query (bq-remove-project id))))
 
 (defconst bq-query-processors
   (ht ("--output=json" (ht (:format "prettyjson")
@@ -411,17 +452,18 @@
     (while (not (or (char-equal (char-before) ?\n)
                     (char-equal (char-before) ?\s)))
         (backward-char))
-    (-let ((case-fold-search t))
-      (or (looking-back "\\bfrom[\s\n]+" 10 t)
-          (looking-back "\\bjoin[\s\n]+" 10 t)
-          (looking-back "\\bunnest([\s\n]+" 10 t)))))
+    (-let ((case-fold-search t)
+           (distance (min 10 (point))))
+      (or (looking-back "\\bfrom[\s\n]+" distance t)
+          (looking-back "\\bjoin[\s\n]+" distance t)
+          (looking-back "\\bunnest([\s\n]+" distance t)))))
 
 (defun bq-query-completions-fields-candidates (tables)
   (seq-mapcat
    (lambda (table)
      (-let ((data (pcache-get (bq-project-cache-repo (or bq-current-project
-                                                            (bq-get-current-project)))
-                                 (intern (format "--bq-table--%s" table)))))
+                                                         (bq-get-current-project)))
+                              (intern (format "--bq-table--%s" (bq-remove-project table))))))
        (when data
            (--mapcat (-let* ((name (s-join "." (ht-get it "path")))
                              (dataset (ht-get it "dataset"))
@@ -474,10 +516,18 @@
            (s-match-strings-all "\\(?:join\\|from\\)\s+`?\\(\\(?:\\s_\\|\\w\\)+\\)"
                                 text))))
 
+(defun wrap-spinner (p)
+  (spinner-start 'progress-bar)
+  (-let ((pm (aio-catch p)))
+    (aio-listen pm (lambda (&rest _) (spinner-stop)))
+    pm))
+
 (defun company-bq-query-backend (command &optional arg &rest _)
   (interactive (list 'interactive))
   (case command
-    (interactive (company-begin-backend 'company-bq-query-backend))
+    (interactive (progn
+                   (wrap-spinner (bq-get-entities-list :datasets nil nil nil t))
+                   (company-begin-backend 'company-bq-query-backend)))
     (prefix (and (eq major-mode 'bq-query-mode)
                  (if (bq--table-context-p)
                      (propertize (company-grab-symbol)
@@ -490,7 +540,7 @@
        (remove-if-not
         (lambda (c) (string-prefix-p (downcase arg) c))
         (if (eql 'table (get-text-property 0 'context arg))
-            (if (s-contains? "." arg)
+            (if (s-contains-p "." arg)
                 (bq-query-completions-tables-candidates (bq-extract-dataset arg))
               (bq-query-completions-datasets-candidates))
           (-let ((tables (bq-find-used-tables)))
@@ -498,6 +548,14 @@
             (bq-query-completions-fields-candidates tables))))))
     (annotation (get-text-property 0 'annotation arg))
     (meta (get-text-property 0 'meta arg))
+    (post-completion
+     (-let ((ann (get-text-property 0 'annotation arg)))
+       (message "ann %s => %s" ann arg)
+       (cond ((s-contains-p "[TABLE]" ann) (wrap-spinner (bq-get-table-fields arg nil t)))
+             ((s-contains-p "[DATASET]" ann)
+              (wrap-spinner
+               (bq-get-entities-list :tables nil (s-replace-regexp "\\\.$" "" arg) nil t)))
+             (:else nil))))
     (ignore-case t)))
 
 (add-to-list 'company-backends 'company-bq-query-backend)
