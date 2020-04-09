@@ -517,16 +517,33 @@
                                 text))))
 
 (defun wrap-spinner (p)
-  (spinner-start 'progress-bar)
-  (-let ((pm (aio-catch p)))
-    (aio-listen pm (lambda (&rest _) (spinner-stop)))
+  (spinner-start 'half-circle)
+  (-let* ((buffer (current-buffer))
+          (pm (aio-catch p)))
+    (aio-listen pm (lambda (&rest _)
+                     (save-excursion
+                       (switch-to-buffer buffer)
+                       (spinner-stop))))
     pm))
+
+(aio-defun bq-precache-buffer ()
+  (interactive)
+  (spinner-start 'half-circle)
+  (-let* ((buffer (current-buffer))
+          (datasets-p (bq-get-entities-list :datasets nil nil nil t))
+          (tables (bq-find-used-tables))
+          (tp (--map (bq-get-table-fields it nil t) tables))
+          (all-p (aio-catch (aio-all (append (list datasets-p) tp)))))
+    (aio-listen all-p (lambda (&rest _)
+                        (save-excursion
+                          (switch-to-buffer buffer)
+                          (spinner-stop))))))
 
 (defun company-bq-query-backend (command &optional arg &rest _)
   (interactive (list 'interactive))
   (case command
     (interactive (progn
-                   (wrap-spinner (bq-get-entities-list :datasets nil nil nil t))
+                   (bq-precache-buffer)
                    (company-begin-backend 'company-bq-query-backend)))
     (prefix (and (eq major-mode 'bq-query-mode)
                  (if (bq--table-context-p)
@@ -549,7 +566,7 @@
     (annotation (get-text-property 0 'annotation arg))
     (meta (get-text-property 0 'meta arg))
     (post-completion
-     (-let ((ann (get-text-property 0 'annotation arg)))
+     (-let* ((ann (get-text-property 0 'annotation arg)))
        (message "ann %s => %s" ann arg)
        (cond ((s-contains-p "[TABLE]" ann) (wrap-spinner (bq-get-table-fields arg nil t)))
              ((s-contains-p "[DATASET]" ann)
