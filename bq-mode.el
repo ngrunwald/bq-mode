@@ -376,7 +376,8 @@
         (switch-to-buffer buffer)
         (bq-query-mode)
         (insert (format "SELECT  FROM `%s`;" table-id))
-        (move-to-column 7)))))
+        (move-to-column 7)
+        (bq-precache-buffer)))))
 
 (defun bq-query-from-list ()
   ""
