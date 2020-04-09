@@ -368,15 +368,18 @@
   (-let ((id (tabulated-list-get-id)))
     (bq-entity-info id)))
 
-(defun bq-start-query (table-id)
-  (-let ((buffer (format "BQ-%s" table-id)))
+(defun bq-start-query (&optional table-id)
+  (interactive)
+  (-let ((buffer (format "BQ-%s" (or table-id "custom-query"))))
     (if (buffer-live-p (get-buffer buffer))
         (switch-to-buffer buffer)
       (progn
         (switch-to-buffer buffer)
         (bq-query-mode)
-        (insert (format "SELECT  FROM `%s`;" table-id))
-        (move-to-column 7)
+        (insert (if table-id
+                    (format "SELECT  FROM `%s`;" table-id)
+                  "SELECT  FROM "))
+        (when table-id (move-to-column 7))
         (bq-precache-buffer)))))
 
 (defun bq-query-from-list ()
@@ -457,9 +460,10 @@
   (save-excursion
     (while (not (or (char-equal (char-before) ?\n)
                     (char-equal (char-before) ?\s)))
-        (backward-char))
+      (backward-char))
     (-let ((case-fold-search t)
-           (distance (min 10 (point))))
+           (distance (min 10 (- (point) (point-min)))))
+      (message "dist %s %s %s" distance (point) (point-min))
       (or (looking-back "\\bfrom[\s\n]+" distance t)
           (looking-back "\\bjoin[\s\n]+" distance t)
           (looking-back "\\bunnest([\s\n]+" distance t)))))
